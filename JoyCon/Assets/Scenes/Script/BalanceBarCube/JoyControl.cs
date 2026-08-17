@@ -14,9 +14,11 @@ public class JoyControl : MonoBehaviour
     bool initialized = false;
 
     public Vector3 angles;
+    [SerializeField] private float angle_pow = 0.1f;
     float rx, ry, rz;
     //public float ax, ay, az;
     public Vector3 accel;
+    public float accel_pow = 2.0f;
 
     private void Awake()
     {
@@ -72,10 +74,12 @@ public class JoyControl : MonoBehaviour
         rz = q.eulerAngles.z + adjust;
         angles.z = rz;
 
+        angles = angles * angle_pow;
+
         //gameObject.transform.localEulerAngles = new Vector3(0, 0, rz);
 
         // ‰Á‘¬“x‚ÌŽæ“¾ (’PˆÊ: G)
-        accel = joycon.GetAccel();
+        accel = joycon.GetAccel() * accel_pow;
 
     }
 }

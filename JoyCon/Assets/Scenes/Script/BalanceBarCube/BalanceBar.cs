@@ -9,11 +9,14 @@ public class BalanceBar : MonoBehaviour
     public float rotation_speed = 30.0f;
     public GameObject game_object;
     public Vector3 world_rotation;
+
+    private Vector3 local_position;
     //public float wrx, wry, wrz;
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
     {
         joyControl = JoyControl.Instance;
+        local_position = game_object.transform.localPosition;
     }
 
     // Update is called once per frame
@@ -40,8 +43,13 @@ public class BalanceBar : MonoBehaviour
 //            transform.Rotate(0f, 0f, -rotation_speed * Time.deltaTime, Space.Self);
         }
 
-        //ワールドローテーション
+        //ワールドローテーション <- ローカルローテーション
         transform.localEulerAngles = new Vector3(0.0f, 0.0f, joyControl.angles.z);
         world_rotation = game_object.transform.rotation.eulerAngles;
+
+        //高さ調整
+        float pos_y = -joyControl.accel.y;
+        transform.localPosition = local_position + new Vector3(0.0f, pos_y, 0.0f);
+
     }
 }
