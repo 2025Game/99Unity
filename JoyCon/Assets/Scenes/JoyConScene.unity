@@ -912,10 +912,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 0e92cf9b7a3ec2b4faba927795079e62, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  rx: 0
-  ry: 0
-  rz: 0
+  angles: {x: 0, y: 0, z: 0}
+  angle_pow: 0.5
   accel: {x: 0, y: 0, z: 0}
+  accel_pow: 2
 --- !u!1 &1222771526
 GameObject:
   m_ObjectHideFlags: 0
@@ -1243,7 +1243,7 @@ GameObject:
   - component: {fileID: 1655365684}
   - component: {fileID: 1655365685}
   m_Layer: 0
-  m_Name: Capsule
+  m_Name: PlayerCapsule
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -1389,7 +1389,7 @@ GameObject:
   - component: {fileID: 1802049812}
   - component: {fileID: 1802049813}
   m_Layer: 0
-  m_Name: Cube
+  m_Name: BalanceBarCube
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -1511,10 +1511,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 0e92cf9b7a3ec2b4faba927795079e62, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  rx: 0
-  ry: 0
-  rz: 0
+  angles: {x: 0, y: 0, z: 0}
+  angle_pow: 0.5
   accel: {x: 0, y: 0, z: 0}
+  accel_pow: 2
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
