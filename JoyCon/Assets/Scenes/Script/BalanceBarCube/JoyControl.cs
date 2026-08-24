@@ -15,6 +15,7 @@ public class JoyControl : MonoBehaviour
 
     public Vector3 angles;
     [SerializeField] private float angle_pow = 0.1f;
+    public float sign = 1.0f;
     float rx, ry, rz;
     //public float ax, ay, az;
     public Vector3 accel;
@@ -66,6 +67,11 @@ public class JoyControl : MonoBehaviour
         {
             adjust = -q.eulerAngles.z;
         }
+        //BÉ{É^ÉìÇ≈ç∂âEîΩì]
+        if (joycon.GetButtonDown(Joycon.Button.DPAD_DOWN))
+        {
+            sign = -sign;
+        }
 
         //q = joycon.GetVector();
         angles = q.eulerAngles;
@@ -74,7 +80,7 @@ public class JoyControl : MonoBehaviour
         rz = q.eulerAngles.z + adjust;
         angles.z = rz;
 
-        angles = angles * angle_pow;
+        angles = angles * angle_pow * sign;
 
         //gameObject.transform.localEulerAngles = new Vector3(0, 0, rz);
 
