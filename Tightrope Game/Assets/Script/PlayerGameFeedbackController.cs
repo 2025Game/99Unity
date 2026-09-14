@@ -1,0 +1,915 @@
+using System;
+using System.Collections;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+/*
+  ◆説明
+　プレイヤーへのゲーム中フィードバックをまとめて管理するスクリプトです。
+　成功音、カウント音、失敗音、ダメージ加算、赤点滅、5ミス時の落下演出とゲームオーバー遷移を担当します。
+　イベント側のスクリプトは、演出やダメージ発生時に下の public メソッドを呼んでください。
+
+　◆使い方
+　・成功音を鳴らしたい場合
+　　PlaySuccessSound() を呼びます。
+
+　・カウント音を鳴らしたい場合
+　　PlayCountSound() を呼びます。
+
+　・失敗音を鳴らしたい場合
+　　PlayMissSound() を呼びます。
+
+　・ダメージを与えたい場合
+　　AddDamage() を呼ぶと 1 ダメージ加算します。
+　　AddDamage(int amount) を呼ぶと指定した量だけダメージ加算します。
+　　ダメージ加算時には赤点滅も発生します。
+
+　・赤点滅だけ出したい場合
+　　FlashRed() を呼びます。
+
+　・ダメージ数をリセットしたい場合
+　　ResetDamage() を呼びます。
+
+　◆注意点
+　・AddDamage() / AddDamage(int) により damageCount が maxDamageCount 以上になると、落下演出後にgameOverSceneNameのシーンへ遷移します。
+　・失敗音だけ鳴らす、赤点滅だけ出す、ダメージだけ加算するなど、イベント内容に合わせて呼ぶメソッドを使い分けてください。
+　・Inspector で audioSource、successClip、countClip、missClip を設定してください。
+　・赤点滅を使う場合は playerRenderers を設定してください。
+　・gameOverSceneName は Build Settings に登録されているシーン名と合わせてください。
+　・現在のダメージ数は DamageCount、最大ダメージ数は MaxDamageCount から読み取りできます。
+ */
+public class PlayerGameFeedbackController : MonoBehaviour
+{
+    [Header("Damage")]
+    // 何回ダメージを受けたらゲームオーバーにするかです。
+    [SerializeField] private int maxDamageCount = 5;
+    // ゲームオーバー時に遷移するScene名です。
+    [SerializeField] private string gameOverSceneName = "GameOverScene";
+    [SerializeField] private string clearSceneName = "ClearScene";
+
+    [Header("Audio")]
+    // SEを再生するAudioSourceです。
+    // 未設定なら、このGameObjectに付いているAudioSourceを探します。
+    [SerializeField] private AudioSource audioSource;
+    [SerializeField] private AudioClip successClip;
+    [SerializeField] private AudioClip countClip;
+    [SerializeField] private AudioClip missClip;
+
+    [Header("Red Flash")]
+    // ミス/ダメージ時に赤く光らせたいRendererを入れます。
+    [SerializeField] private Renderer[] playerRenderers;
+    // 赤く光る時間です。
+    [SerializeField] private float redFlashDuration = 0.2f;
+    // 発光時の赤色です。
+    [SerializeField] private Color redFlashColor = Color.red;
+    // Emissionを持つMaterialの場合、この強さで発光させます。
+    [SerializeField] private float redEmissionIntensity = 2f;
+
+    [Header("ミス時の落下")]
+    [Tooltip("落下させるプレイヤー本体のTransformです。未設定の場合はMoverやAnimatorなどから自動取得を試します。")]
+    [SerializeField] private Transform playerTransform;
+
+    [Tooltip("歩き停止と落下Triggerに使用するプレイヤーのAnimatorです。未設定の場合はPlayer Transformの子から探します。")]
+    [SerializeField] private Animator playerAnimator;
+
+    [Tooltip("既存の歩きアニメーションを制御するBool Parameter名です。")]
+    [SerializeField] private string walkBoolName = "catwalk";
+
+    [Tooltip("落下アニメーションを開始するTrigger Parameter名です。")]
+    [SerializeField] private string fallTriggerName = "fall";
+
+    [Tooltip("プレイヤー座標を下へ移動させる時間です。")]
+    [SerializeField, Min(0f)] private float fallDuration = 2f;
+
+    [Tooltip("地面参照が未設定の場合だけ使用する旧落下距離です。")]
+    [SerializeField, Min(0f)] private float fallDistance = 5f;
+
+    [Tooltip("落下演出でプレイヤーの足元を合わせる地面位置です。")]
+    [SerializeField] private Transform fallGroundTarget;
+
+    [Tooltip("落下開始からGameOverSceneへ遷移するまでの時間です。落下を最後まで見せる場合はFall Duration以上にします。")]
+    [SerializeField, Min(0f)] private float gameOverDelay = 2f;
+
+    [Tooltip("落下中に通常バランスゲージを停止するためのBalanceManagerです。")]
+    [SerializeField] private BalanceManager balanceManager;
+
+    [Tooltip("落下開始時に自動移動と登録済み手動移動を停止するためのMoverです。")]
+    [SerializeField] private TightropeAutoGoalMover tightropeAutoGoalMover;
+
+    [Tooltip("落下中に分岐入力とルート進行を停止するためのRoute Controllerです。")]
+    [SerializeField] private TightropeRouteController tightropeRouteController;
+
+    [Header("Debug")]
+    [SerializeField] private bool debugLog = true;
+
+    private Material[][] cachedMaterials;
+    private Color[][] originalBaseColors;
+    private Color[][] originalEmissionColors;
+    private bool[][] originalEmissionEnabled;
+    private Coroutine redFlashCoroutine;
+    private int damageCount;
+    private bool isFallingToGameOver;
+    private bool isRecoveryInvulnerable;
+    private bool isRecoveryBlinkActive;
+    private bool[] recoveryBlinkRendererStates;
+    private bool hasLoggedMissingFallGroundTarget;
+
+    public int DamageCount => damageCount;
+    public int MaxDamageCount => maxDamageCount;
+    public bool IsFallingToGameOver => isFallingToGameOver;
+
+    // 体幹メーターなど、ダメージ数の表示だけを担当するUIへ変更後の値を通知します。
+    public event Action<int> DamageCountChanged;
+
+    private void Awake()
+    {
+        if (audioSource == null)
+        {
+            audioSource = GetComponent<AudioSource>();
+        }
+
+        ResolveFallReferences();
+        ValidateFallSettings();
+        CacheOriginalMaterialColors();
+    }
+
+    private void OnDisable()
+    {
+        EndRecoveryBlink();
+        isRecoveryInvulnerable = false;
+    }
+
+    public void PlaySuccessSound()
+    {
+        PlayOneShot(successClip, "success");
+    }
+
+    public void PlayCountSound()
+    {
+        PlayOneShot(countClip, "count");
+    }
+
+    public void PlayMissSound()
+    {
+        PlayOneShot(missClip, "miss");
+    }
+
+    public void AddDamage()
+    {
+        AddDamage(1);
+    }
+
+    public void AddDamage(int amount)
+    {
+        if (isFallingToGameOver)
+        {
+            DebugLog("Damage ignored because the GameOver fall sequence is already running.");
+            return;
+        }
+
+        if (isRecoveryInvulnerable)
+        {
+            DebugLog("Damage ignored during managed fall recovery protection.");
+            return;
+        }
+
+        int addAmount = Mathf.Max(0, amount);
+        damageCount = Mathf.Min(damageCount + addAmount, maxDamageCount);
+        DebugLog($"Damage added. damageCount={damageCount}/{maxDamageCount}");
+
+        // GameOver判定より先に通知し、5回目も既存Scene遷移前に最新値へ更新できるようにします。
+        DamageCountChanged?.Invoke(damageCount);
+        FlashRed();
+
+        if (damageCount >= maxDamageCount)
+        {
+            StartGameOverFallSequence();
+        }
+    }
+
+    public void ResetDamage()
+    {
+        damageCount = 0;
+        DebugLog("Damage reset.");
+        DamageCountChanged?.Invoke(damageCount);
+    }
+
+    public void LoadClearScene()
+    {
+        if (string.IsNullOrEmpty(clearSceneName))
+        {
+            DebugLog("Clear scene name is empty. Scene load skipped.");
+            return;
+        }
+
+        if (damageCount >= maxDamageCount)
+        {
+            DebugLog($"Clear scene load skipped because damageCount={damageCount}/{maxDamageCount}. GameOver should handle this state.");
+            return;
+        }
+
+        ClearResultManager.ClearRank clearRank = CalculateClearRank();
+        ClearResultData.SetResult(clearRank, damageCount);
+
+        DebugLog($"Loading clear scene: {clearSceneName}, rank={clearRank}, missCount={damageCount}");
+        SceneManager.LoadScene(clearSceneName);
+    }
+
+    public void FlashRed()
+    {
+        if (redFlashCoroutine != null)
+        {
+            StopCoroutine(redFlashCoroutine);
+            RestoreOriginalMaterialColors();
+        }
+
+        redFlashCoroutine = StartCoroutine(RedFlashRoutine());
+    }
+
+    private IEnumerator RedFlashRoutine()
+    {
+        ApplyRedFlashColor();
+
+        if (redFlashDuration > 0f)
+        {
+            yield return new WaitForSeconds(redFlashDuration);
+        }
+
+        RestoreOriginalMaterialColors();
+        redFlashCoroutine = null;
+    }
+
+    private void StartGameOverFallSequence()
+    {
+        if (isFallingToGameOver)
+        {
+            return;
+        }
+
+        isFallingToGameOver = true;
+        StartCoroutine(GameOverFallRoutine());
+    }
+
+    private IEnumerator GameOverFallRoutine()
+    {
+        StopPlayerForFall();
+
+        float safeGameOverDelay = Mathf.Max(0f, gameOverDelay);
+        float sequenceStartTime = Time.time;
+        yield return WaitForManagedFallToGroundAndAnimationComplete(true);
+
+        float remainingDelay = safeGameOverDelay - (Time.time - sequenceStartTime);
+        while (remainingDelay > 0f)
+        {
+            remainingDelay -= Time.deltaTime;
+            yield return null;
+        }
+
+        LoadGameOverScene();
+    }
+
+    private void StopPlayerForFall()
+    {
+        // ComponentをDisableすると旧BalanceGaugeの抑制が解除されるため、GameOver専用停止を使用します。
+        if (tightropeRouteController != null)
+        {
+            tightropeRouteController.StopForGameOver();
+        }
+
+        if (tightropeAutoGoalMover != null)
+        {
+            tightropeAutoGoalMover.PlayerStoping = true;
+            tightropeAutoGoalMover.StopMoving();
+            tightropeAutoGoalMover.SetManualMovementEnabled(false);
+        }
+
+        // Route ControllerのOnDisableがゲージを再開する場合があるため、最後に停止します。
+        if (balanceManager != null)
+        {
+            balanceManager.PauseNormalBalanceGauge();
+        }
+
+        PlayFallAnimationVisual();
+    }
+
+    // 1～4ミス時の管理落下と、既存の5ミスGameOver落下で同じ見た目を再利用します。
+    public void PlayFallAnimationVisual()
+    {
+        if (playerAnimator == null)
+        {
+            ResolveFallReferences();
+        }
+
+        if (playerAnimator == null)
+        {
+            return;
+        }
+
+        if (HasAnimatorParameter(walkBoolName, AnimatorControllerParameterType.Bool))
+        {
+            playerAnimator.SetBool(walkBoolName, false);
+        }
+
+        if (HasAnimatorParameter(fallTriggerName, AnimatorControllerParameterType.Trigger))
+        {
+            playerAnimator.SetTrigger(fallTriggerName);
+        }
+    }
+
+    // Fall Stateへ入ったこととnormalizedTimeを確認し、未設定時も既存Fall Durationで安全に抜けます。
+    public IEnumerator WaitForManagedFallAnimationComplete()
+    {
+        if (playerAnimator == null)
+        {
+            ResolveFallReferences();
+        }
+
+        if (playerAnimator == null || !playerAnimator.isActiveAndEnabled)
+        {
+            yield break;
+        }
+
+        const int animatorLayer = 0;
+        int fallStateHash = Animator.StringToHash("Fall");
+        float timeout = Mathf.Max(0.1f, fallDuration);
+        float elapsed = 0f;
+        bool enteredFallState = false;
+
+        while (elapsed < timeout)
+        {
+            if (playerAnimator == null || !playerAnimator.isActiveAndEnabled)
+            {
+                yield break;
+            }
+
+            AnimatorStateInfo stateInfo = playerAnimator.GetCurrentAnimatorStateInfo(animatorLayer);
+            bool isFallState = stateInfo.shortNameHash == fallStateHash;
+            if (isFallState)
+            {
+                if (!enteredFallState)
+                {
+                    enteredFallState = true;
+                    float stateSpeed = Mathf.Max(0.01f, Mathf.Abs(stateInfo.speed * stateInfo.speedMultiplier));
+                    float stateDuration = stateInfo.length / stateSpeed;
+                    timeout = Mathf.Max(timeout, elapsed + stateDuration * 1.5f);
+                }
+
+                if (stateInfo.normalizedTime >= 1f && !playerAnimator.IsInTransition(animatorLayer))
+                {
+                    yield break;
+                }
+            }
+            else if (enteredFallState && !playerAnimator.IsInTransition(animatorLayer))
+            {
+                yield break;
+            }
+
+            elapsed += Time.unscaledDeltaTime;
+            yield return null;
+        }
+
+        Debug.LogWarning(
+            enteredFallState
+                ? "PlayerGameFeedbackController: Fallアニメーション完了待ちがTimeoutしたため、復帰処理を続行します。"
+                : "PlayerGameFeedbackController: AnimatorがFall Stateへ入らなかったため、Timeout後に復帰処理を続行します。",
+            this);
+    }
+
+    // 1～4ミスと5ミスで、同じ地面位置へのRoot移動とFall Animation完了待ちを並行して行います。
+    public IEnumerator WaitForManagedFallToGroundAndAnimationComplete(bool isGameOverFall)
+    {
+        bool animationCompleted = false;
+        StartCoroutine(WaitForManagedFallAnimationAndMarkComplete(() => animationCompleted = true));
+
+        yield return MovePlayerRootToFallGround(isGameOverFall);
+
+        while (!animationCompleted)
+        {
+            yield return null;
+        }
+    }
+
+    private IEnumerator WaitForManagedFallAnimationAndMarkComplete(Action onComplete)
+    {
+        yield return WaitForManagedFallAnimationComplete();
+        onComplete?.Invoke();
+    }
+
+    private IEnumerator MovePlayerRootToFallGround(bool isGameOverFall)
+    {
+        if (playerTransform == null)
+        {
+            ResolveFallReferences();
+        }
+
+        if (playerTransform == null)
+        {
+            yield break;
+        }
+
+        Vector3 startPosition = playerTransform.position;
+        float targetRootY = startPosition.y - Mathf.Max(0f, fallDistance);
+        float groundY = targetRootY;
+
+        if (fallGroundTarget != null)
+        {
+            groundY = fallGroundTarget.position.y;
+            float rootToFeetOffset = CalculateRootToFeetOffset();
+            targetRootY = groundY + rootToFeetOffset;
+        }
+        else if (!hasLoggedMissingFallGroundTarget)
+        {
+            hasLoggedMissingFallGroundTarget = true;
+            Debug.LogWarning(
+                "PlayerGameFeedbackController: Fall Ground Targetが未設定のため、旧Fall DistanceへFallbackします。",
+                this);
+        }
+
+        // 誤設定時にも落下演出で上方向へ移動しないよう、開始位置を上限にします。
+        targetRootY = Mathf.Min(startPosition.y, targetRootY);
+        Vector3 targetPosition = new Vector3(startPosition.x, targetRootY, startPosition.z);
+        float safeFallDuration = Mathf.Max(0f, fallDuration);
+        float elapsedTime = 0f;
+
+        DebugLog(
+            $"[Managed Fall] Damage={damageCount}, StartY={startPosition.y:F4}, GroundY={groundY:F4}, " +
+            $"TargetRootY={targetRootY:F4}, IsGameOverFall={isGameOverFall}");
+
+        while (elapsedTime < safeFallDuration)
+        {
+            float fallProgress = safeFallDuration <= 0f
+                ? 1f
+                : Mathf.Clamp01(elapsedTime / safeFallDuration);
+            playerTransform.position = Vector3.Lerp(startPosition, targetPosition, fallProgress);
+            elapsedTime += Time.deltaTime;
+            yield return null;
+        }
+
+        playerTransform.position = targetPosition;
+        DebugLog(
+            $"[Managed Fall] Damage={damageCount}, FinalY={playerTransform.position.y:F4}, " +
+            $"IsGameOverFall={isGameOverFall}");
+    }
+
+    private float CalculateRootToFeetOffset()
+    {
+        bool hasBounds = false;
+        float feetY = float.PositiveInfinity;
+
+        if (playerRenderers != null)
+        {
+            for (int i = 0; i < playerRenderers.Length; i++)
+            {
+                Renderer playerRenderer = playerRenderers[i];
+                if (playerRenderer == null || !playerRenderer.gameObject.activeInHierarchy)
+                {
+                    continue;
+                }
+
+                feetY = Mathf.Min(feetY, playerRenderer.bounds.min.y);
+                hasBounds = true;
+            }
+        }
+
+        if (!hasBounds)
+        {
+            Collider playerCollider = playerTransform.GetComponentInChildren<Collider>(true);
+            if (playerCollider != null)
+            {
+                feetY = playerCollider.bounds.min.y;
+                hasBounds = true;
+            }
+        }
+
+        return hasBounds
+            ? Mathf.Max(0f, playerTransform.position.y - feetY)
+            : 0f;
+    }
+
+    // Fallには通常歩行への遷移がないため、既存catwalk Stateへ小さくCrossFadeして復帰します。
+    public void RestoreAnimatorAfterManagedFall()
+    {
+        if (playerAnimator == null)
+        {
+            ResolveFallReferences();
+        }
+
+        if (playerAnimator == null)
+        {
+            return;
+        }
+
+        if (HasAnimatorParameter(fallTriggerName, AnimatorControllerParameterType.Trigger))
+        {
+            playerAnimator.ResetTrigger(fallTriggerName);
+        }
+
+        if (HasAnimatorParameter(walkBoolName, AnimatorControllerParameterType.Bool))
+        {
+            playerAnimator.SetBool(walkBoolName, true);
+        }
+
+        int walkStateHash = Animator.StringToHash("Base Layer.catwalk");
+        if (playerAnimator.HasState(0, walkStateHash))
+        {
+            playerAnimator.CrossFade(walkStateHash, 0.1f, 0, 0f);
+        }
+        else
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Animatorにcatwalk Stateがないため、Bool設定だけで復帰します。", this);
+        }
+    }
+
+    public void SetRecoveryInvulnerable(bool invulnerable)
+    {
+        if (invulnerable && isFallingToGameOver)
+        {
+            return;
+        }
+
+        isRecoveryInvulnerable = invulnerable;
+    }
+
+    // 赤フラッシュとは分離し、既存Rendererのenabled状態だけを点滅用に保存します。
+    public void BeginRecoveryBlink()
+    {
+        EndRecoveryBlink();
+        if (playerRenderers == null || playerRenderers.Length == 0)
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: 復帰点滅用のPlayer Renderersが未設定です。", this);
+            return;
+        }
+
+        recoveryBlinkRendererStates = new bool[playerRenderers.Length];
+        for (int i = 0; i < playerRenderers.Length; i++)
+        {
+            Renderer renderer = playerRenderers[i];
+            recoveryBlinkRendererStates[i] = renderer != null && renderer.enabled;
+        }
+
+        isRecoveryBlinkActive = true;
+        SetRecoveryBlinkVisible(true);
+    }
+
+    public void SetRecoveryBlinkVisible(bool visible)
+    {
+        if (!isRecoveryBlinkActive || recoveryBlinkRendererStates == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < playerRenderers.Length && i < recoveryBlinkRendererStates.Length; i++)
+        {
+            Renderer renderer = playerRenderers[i];
+            if (renderer != null)
+            {
+                renderer.enabled = recoveryBlinkRendererStates[i] && visible;
+            }
+        }
+    }
+
+    public void EndRecoveryBlink()
+    {
+        if (recoveryBlinkRendererStates != null && playerRenderers != null)
+        {
+            for (int i = 0; i < playerRenderers.Length && i < recoveryBlinkRendererStates.Length; i++)
+            {
+                Renderer renderer = playerRenderers[i];
+                if (renderer != null)
+                {
+                    renderer.enabled = recoveryBlinkRendererStates[i];
+                }
+            }
+        }
+
+        recoveryBlinkRendererStates = null;
+        isRecoveryBlinkActive = false;
+    }
+
+    private bool HasAnimatorParameter(string parameterName, AnimatorControllerParameterType parameterType)
+    {
+        if (playerAnimator == null || string.IsNullOrEmpty(parameterName))
+        {
+            return false;
+        }
+
+        AnimatorControllerParameter[] parameters = playerAnimator.parameters;
+        for (int i = 0; i < parameters.Length; i++)
+        {
+            AnimatorControllerParameter parameter = parameters[i];
+            if (parameter.name == parameterName && parameter.type == parameterType)
+            {
+                return true;
+            }
+        }
+
+        Debug.LogWarning(
+            $"PlayerGameFeedbackController: Animatorに{parameterType} Parameter『{parameterName}』がありません。",
+            this);
+        return false;
+    }
+
+    private void ResolveFallReferences()
+    {
+        if (playerTransform == null && tightropeAutoGoalMover != null)
+        {
+            playerTransform = tightropeAutoGoalMover.transform;
+        }
+
+        if (playerTransform == null && playerAnimator != null)
+        {
+            playerTransform = playerAnimator.transform.root;
+        }
+
+        if (playerTransform == null && playerRenderers != null)
+        {
+            for (int i = 0; i < playerRenderers.Length; i++)
+            {
+                if (playerRenderers[i] == null)
+                {
+                    continue;
+                }
+
+                playerTransform = playerRenderers[i].transform.root;
+                break;
+            }
+        }
+
+        if (playerTransform != null)
+        {
+            if (tightropeAutoGoalMover == null)
+            {
+                tightropeAutoGoalMover = playerTransform.GetComponent<TightropeAutoGoalMover>();
+            }
+
+            if (tightropeRouteController == null)
+            {
+                tightropeRouteController = playerTransform.GetComponent<TightropeRouteController>();
+            }
+
+            if (playerAnimator == null)
+            {
+                playerAnimator = playerTransform.GetComponentInChildren<Animator>(true);
+            }
+        }
+    }
+
+    private void ValidateFallSettings()
+    {
+        if (playerTransform == null)
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Player Transformが見つかりません。落下移動を省略してGameOverへ遷移します。", this);
+        }
+
+        if (playerAnimator == null)
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Player Animatorが見つかりません。落下アニメーションを省略します。", this);
+        }
+
+        if (balanceManager == null)
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Balance Managerが未設定です。落下中の通常ゲージ停止を省略します。", this);
+        }
+
+        if (tightropeAutoGoalMover == null)
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Tightrope Auto Goal Moverが未設定です。Moverの停止処理を省略します。", this);
+        }
+
+        if (tightropeRouteController == null)
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Tightrope Route Controllerが未設定です。ルート入力の停止処理を省略します。", this);
+        }
+
+        if (string.IsNullOrEmpty(walkBoolName))
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Walk Bool Nameが空です。歩きBoolの停止を省略します。", this);
+        }
+
+        if (string.IsNullOrEmpty(fallTriggerName))
+        {
+            Debug.LogWarning("PlayerGameFeedbackController: Fall Trigger Nameが空です。落下Triggerを省略します。", this);
+        }
+    }
+
+    private void LoadGameOverScene()
+    {
+        if (string.IsNullOrEmpty(gameOverSceneName))
+        {
+            DebugLog("GameOver scene name is empty. Scene load skipped.");
+            return;
+        }
+
+        DebugLog($"Loading game over scene: {gameOverSceneName}");
+        SceneManager.LoadScene(gameOverSceneName);
+    }
+
+    private ClearResultManager.ClearRank CalculateClearRank()
+    {
+        if (damageCount <= 1)
+        {
+            return ClearResultManager.ClearRank.S;
+        }
+
+        if (damageCount == 2)
+        {
+            return ClearResultManager.ClearRank.A;
+        }
+
+        return ClearResultManager.ClearRank.B;
+    }
+
+    private void PlayOneShot(AudioClip clip, string label)
+    {
+        if (audioSource == null)
+        {
+            DebugLog($"AudioSource is not assigned. {label} sound skipped.");
+            return;
+        }
+
+        if (clip == null)
+        {
+            DebugLog($"{label} clip is not assigned.");
+            return;
+        }
+
+        audioSource.PlayOneShot(clip);
+    }
+
+    private void CacheOriginalMaterialColors()
+    {
+        if (playerRenderers == null)
+        {
+            return;
+        }
+
+        cachedMaterials = new Material[playerRenderers.Length][];
+        originalBaseColors = new Color[playerRenderers.Length][];
+        originalEmissionColors = new Color[playerRenderers.Length][];
+        originalEmissionEnabled = new bool[playerRenderers.Length][];
+
+        for (int i = 0; i < playerRenderers.Length; i++)
+        {
+            Renderer renderer = playerRenderers[i];
+            if (renderer == null)
+            {
+                continue;
+            }
+
+            cachedMaterials[i] = renderer.materials;
+            originalBaseColors[i] = new Color[cachedMaterials[i].Length];
+            originalEmissionColors[i] = new Color[cachedMaterials[i].Length];
+            originalEmissionEnabled[i] = new bool[cachedMaterials[i].Length];
+
+            for (int j = 0; j < cachedMaterials[i].Length; j++)
+            {
+                Material material = cachedMaterials[i][j];
+                originalBaseColors[i][j] = GetBaseColor(material);
+                originalEmissionColors[i][j] = GetEmissionColor(material);
+                originalEmissionEnabled[i][j] = material != null && material.IsKeywordEnabled("_EMISSION");
+            }
+        }
+    }
+
+    private void ApplyRedFlashColor()
+    {
+        EnsureMaterialCache();
+        if (cachedMaterials == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < cachedMaterials.Length; i++)
+        {
+            if (cachedMaterials[i] == null)
+            {
+                continue;
+            }
+
+            for (int j = 0; j < cachedMaterials[i].Length; j++)
+            {
+                Material material = cachedMaterials[i][j];
+                if (material == null)
+                {
+                    continue;
+                }
+
+                SetBaseColor(material, redFlashColor);
+
+                if (material.HasProperty("_EmissionColor"))
+                {
+                    material.EnableKeyword("_EMISSION");
+                    material.SetColor("_EmissionColor", redFlashColor * redEmissionIntensity);
+                }
+            }
+        }
+    }
+
+    private void RestoreOriginalMaterialColors()
+    {
+        EnsureMaterialCache();
+        if (cachedMaterials == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < cachedMaterials.Length; i++)
+        {
+            if (cachedMaterials[i] == null)
+            {
+                continue;
+            }
+
+            for (int j = 0; j < cachedMaterials[i].Length; j++)
+            {
+                Material material = cachedMaterials[i][j];
+                if (material == null)
+                {
+                    continue;
+                }
+
+                SetBaseColor(material, originalBaseColors[i][j]);
+
+                if (material.HasProperty("_EmissionColor"))
+                {
+                    material.SetColor("_EmissionColor", originalEmissionColors[i][j]);
+
+                    if (originalEmissionEnabled[i][j])
+                    {
+                        material.EnableKeyword("_EMISSION");
+                    }
+                    else
+                    {
+                        material.DisableKeyword("_EMISSION");
+                    }
+                }
+            }
+        }
+    }
+
+    private void EnsureMaterialCache()
+    {
+        if (cachedMaterials == null)
+        {
+            CacheOriginalMaterialColors();
+        }
+    }
+
+    private Color GetBaseColor(Material material)
+    {
+        if (material == null)
+        {
+            return Color.white;
+        }
+
+        if (material.HasProperty("_BaseColor"))
+        {
+            return material.GetColor("_BaseColor");
+        }
+
+        if (material.HasProperty("_Color"))
+        {
+            return material.GetColor("_Color");
+        }
+
+        return Color.white;
+    }
+
+    private void SetBaseColor(Material material, Color color)
+    {
+        if (material == null)
+        {
+            return;
+        }
+
+        if (material.HasProperty("_BaseColor"))
+        {
+            material.SetColor("_BaseColor", color);
+        }
+
+        if (material.HasProperty("_Color"))
+        {
+            material.SetColor("_Color", color);
+        }
+    }
+
+    private Color GetEmissionColor(Material material)
+    {
+        if (material != null && material.HasProperty("_EmissionColor"))
+        {
+            return material.GetColor("_EmissionColor");
+        }
+
+        return Color.black;
+    }
+
+    private void DebugLog(string message)
+    {
+        if (!debugLog)
+        {
+            return;
+        }
+
+        Debug.Log($"[PlayerGameFeedbackController] {message}", this);
+    }
+}
